@@ -3299,9 +3299,11 @@ async function deletePicRole(roleId){
         return out;
     }
     // Kotak di gambar: tim A di kiri (menghadap kanan): kanan = bawah. Tim B di kanan (menghadap kiri): kanan = atas.
-    function courtBoxRect(tl, side) {
-        const x = tl === 'A' ? 40 : 520, w = 440, h = 175;
-        const bottom = (tl === 'A') === (side === 'R');
+    // swapped = true -> Tim B di kiri, Tim A di kanan (hanya tampilan; skor/servis/statistik tidak berubah).
+    function courtBoxRect(tl, side, swapped) {
+        const isLeft = (tl === 'A') !== !!swapped;
+        const x = isLeft ? 40 : 520, w = 440, h = 175;
+        const bottom = isLeft === (side === 'R');
         return { x, y: bottom ? 225 : 40, w, h };
     }
 
@@ -3358,6 +3360,7 @@ async function deletePicRole(roleId){
           <div class="cv-note" id="cvNote"></div>
           <div class="cv-bot">
             <button class="cv-btn" onclick="courtViewUndo()">↩ Undo</button>
+            <button class="cv-btn" id="cvSwapBtn" onclick="courtViewSwap()">⇄ Tukar sisi</button>
             <button class="cv-btn" id="cvPickBtn" onclick="courtViewTogglePick()">🔄 Ubah server</button>
             <button class="cv-btn ok" onclick="courtViewFinish()">✓ Selesaikan Match</button>
           </div>
@@ -3427,12 +3430,16 @@ async function deletePicRole(roleId){
         const names = tl => (m['team' + tl] || []).map(p => p.name).join(' & ');
         const idx = activeMatches.indexOf(m);
         el.querySelector('#cvTitle').textContent = `${m.courtName || ('Lapangan ' + (idx + 1))} · Ronde ${m.round || 1}`;
-        el.querySelector('#cvScoreA').textContent = Number(m.scoreA || 0);
-        el.querySelector('#cvScoreB').textContent = Number(m.scoreB || 0);
+        // Sisi tampilan (kiri/kanan) bisa ditukar; elemen cv*A = sisi KIRI, cv*B = sisi KANAN.
+        const swp = scoreSwapOf(m.id), leftTl = swp ? 'B' : 'A', rightTl = swp ? 'A' : 'B';
+        el.querySelector('#cvScoreA').textContent = courtScoreOfTeam(m, leftTl);
+        el.querySelector('#cvScoreB').textContent = courtScoreOfTeam(m, rightTl);
         const tA = el.querySelector('#cvTeamA'), tB = el.querySelector('#cvTeamB');
-        tA.textContent = names('A'); tB.textContent = names('B');
-        tA.classList.toggle('srv', !!(lay.server && lay.server.tl === 'A'));
-        tB.classList.toggle('srv', !!(lay.server && lay.server.tl === 'B'));
+        tA.textContent = names(leftTl); tB.textContent = names(rightTl);
+        tA.classList.toggle('srv', !!(lay.server && lay.server.tl === leftTl));
+        tB.classList.toggle('srv', !!(lay.server && lay.server.tl === rightTl));
+        const sb = el.querySelector('#cvSwapBtn');
+        if (sb) sb.textContent = swp ? '⇄ Tukar sisi (B di kiri)' : '⇄ Tukar sisi (A di kiri)';
 
         // slot pemain
         ['A', 'B'].forEach(tl => ['R', 'L'].forEach(sd => { el.querySelector(`#cvslot-${tl}-${sd}`).style.display = 'none'; }));
@@ -3440,6 +3447,7 @@ async function deletePicRole(roleId){
             (lay.slots[tl] || []).forEach(s => {
                 const p = (m['team' + tl] || [])[s.idx]; if (!p) return;
                 const g = el.querySelector(`#cvslot-${tl}-${s.side}`); g.style.display = '';
+                { const r0 = courtBoxRect(tl, s.side, false), r1 = courtBoxRect(tl, s.side, swp); g.setAttribute('transform', `translate(${r1.x - r0.x},${r1.y - r0.y})`); }
                 const nm = String(p.name || ''); g.querySelector('.cvs-name').textContent = nm.length > 14 ? nm.slice(0, 13) + '…' : nm;
                 g.querySelector('.cvs-stat').textContent = `P${Number(p.matchPoints || 0)} · ✖${Number(p.matchOuts || 0) + Number(p.matchFaults || 0)}`;
                 const isSrv = lay.server && lay.server.tl === tl && lay.server.idx === s.idx;
@@ -3454,9 +3462,9 @@ async function deletePicRole(roleId){
         // bola + penerima
         const ball = el.querySelector('#cvBall'), recv = el.querySelector('#cvRecv');
         if (lay.server) {
-            const b = courtBoxRect(lay.server.tl, lay.server.side);
+            const b = courtBoxRect(lay.server.tl, lay.server.side, swp);
             ball.style.display = ''; ball.setAttribute('transform', `translate(${b.x + 70},${b.y + b.h - 38})`);
-            const otl = lay.server.tl === 'A' ? 'B' : 'A', rb = courtBoxRect(otl, lay.recvSide);
+            const otl = lay.server.tl === 'A' ? 'B' : 'A', rb = courtBoxRect(otl, lay.recvSide, swp);
             recv.style.display = ''; recv.setAttribute('x', rb.x); recv.setAttribute('y', rb.y);
         } else { ball.style.display = 'none'; recv.style.display = 'none'; }
 
@@ -3512,6 +3520,9 @@ async function deletePicRole(roleId){
     function courtViewTogglePick() { courtPickServer = !courtPickServer; renderCourtView(); }
     function courtViewTimer() { if (courtViewId) toggleTimer(courtViewId); setTimeout(courtViewTick, 150); }
     function courtViewClassic() { courtViewPref = false; closeCourtView(); }
+    // Tukar sisi kiri/kanan di tampilan lapangan. Memakai status tukar yang sama dengan papan skor klasik,
+    // jadi hanya tampilan di perangkat ini yang berubah (tidak menyentuh skor, servis, statistik, riwayat).
+    function courtViewSwap() { if (courtViewId) { toggleScoreSwap(courtViewId); renderCourtView(); } }
     function courtViewBack() { const id = courtViewId; closeCourtView(); closeScoreDashboard(); }
     function courtViewFinish() { if (courtViewId) finishFromDashboard(courtViewId); }
 
