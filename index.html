@@ -2698,6 +2698,7 @@ async function deletePicRole(roleId){
             if (error || !data) { console.error('Gagal menyegarkan data:', error); return; }
             // Selama menunggu jawaban server, mungkin ada perubahan lokal baru -> jangan timpa
             if (pendingScoreOps > 0 || saveInFlight || savePending) { requestRefresh(); return; }
+            await loadCourtScores();
             applyServerRow(data);
         } finally {
             refreshRunning = false;
@@ -3143,6 +3144,106 @@ async function deletePicRole(roleId){
     function performSaveToSupabase() { return withServerLock(() => performSaveToSupabase_raw()); }
     function safeRoundMixMutationCore(...a) { return withServerLock(() => safeRoundMixMutationCore_raw(...a)); }
     function safeApplyToServer(...a) { return withServerLock(() => safeApplyToServer_raw(...a)); }
+
+    // ============================================================================
+    // SKOR PER LAPANGAN (Round Mix): tiap pertandingan punya BARIS SENDIRI di tabel
+    // sm_court_score. Tombol +/- dihitung ATOMIK di database (sm_court_apply), jadi
+    // lapangan 1 dan lapangan 2 tidak saling menunggu, dan dua HP yang menekan
+    // lapangan yang sama bersamaan sama-sama tercatat. Baris utama hanya disentuh
+    // saat match selesai. Matikan dengan COURT_ROWS = false untuk kembali ke cara lama.
+    // ============================================================================
+    const COURT_ROWS = true;
+    let courtScores = {};          // match_id -> baris sm_court_score terakhir yang diketahui
+    const courtPending = {};       // match_id -> jumlah ketukan yang belum dikonfirmasi server
+    const courtChain = {};         // match_id -> antrean berurutan per lapangan
+    let courtRenderTimer = null;
+
+    function applyCourtRowToMatch(m, row) {
+        if (!m || !row) return;
+        m.scoreA = Number(row.score_a || 0); m.scoreB = Number(row.score_b || 0);
+        const pl = row.players || {};
+        ['teamA', 'teamB'].forEach(t => (m[t] || []).forEach((p, i) => {
+            const c = pl[t + '.' + i];
+            if (c) { p.matchPoints = Number(c.p || 0); p.matchOuts = Number(c.o || 0); p.matchFaults = Number(c.f || 0); }
+        }));
+    }
+    function applyCourtOverlay() {
+        if (!COURT_ROWS) return;
+        (activeMatches || []).forEach(m => {
+            if (courtPending[m.id] > 0) return;           // ketukan lokal belum terkonfirmasi: layar ini yang menang dulu
+            const row = courtScores[m.id];
+            if (row) applyCourtRowToMatch(m, row);
+        });
+    }
+    function courtSeedFor(m) {
+        const pl = {};
+        ['teamA', 'teamB'].forEach(t => (m[t] || []).forEach((p, i) => {
+            pl[t + '.' + i] = { p: Number(p.matchPoints || 0), o: Number(p.matchOuts || 0), f: Number(p.matchFaults || 0) };
+        }));
+        return { a: Number(m.scoreA || 0), b: Number(m.scoreB || 0), players: pl };
+    }
+    async function loadCourtScores() {
+        if (!COURT_ROWS || !supabaseClient) return;
+        try {
+            const { data, error } = await supabaseClient.from('sm_court_score').select('*');
+            if (error) { console.warn('[COURT] gagal muat skor lapangan:', error.message); return; }
+            const next = {};
+            (data || []).forEach(r => { next[r.match_id] = r; });
+            courtScores = next;
+        } catch (e) { console.warn('[COURT] error muat:', e); }
+    }
+    function courtRenderSoon() {
+        clearTimeout(courtRenderTimer);
+        courtRenderTimer = setTimeout(() => {
+            applyCourtOverlay();
+            try { renderCourts(); } catch (e) {}
+            try {
+                if (window.scoreDashboardOpen && window.scoreDashboardMatchId) renderScoreDashboard(window.scoreDashboardMatchId);
+            } catch (e) {}
+        }, 120);
+    }
+    function subscribeCourtRealtime() {
+        if (!COURT_ROWS) return;
+        supabaseClient.channel('sm_court_score_changes')
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'sm_court_score' }, payload => {
+                if (payload.eventType === 'DELETE') {
+                    const id = payload.old && payload.old.match_id;
+                    if (id) delete courtScores[id];
+                    return;
+                }
+                const r = payload.new;
+                if (r && r.match_id) { courtScores[r.match_id] = r; courtRenderSoon(); }
+            })
+            .subscribe();
+        // Jaring pengaman: kalau ada event realtime yang terlewat, sinkron ulang tiap 20 detik.
+        setInterval(async () => {
+            if (document.hidden) return;
+            if (Object.values(courtPending).some(n => n > 0)) return;
+            await loadCourtScores(); courtRenderSoon();
+        }, 20000);
+    }
+    // Kirim satu operasi untuk satu lapangan, berurutan per lapangan, dengan beberapa kali coba ulang.
+    function courtEnqueue(matchId, fn) {
+        courtPending[matchId] = (courtPending[matchId] || 0) + 1;
+        const run = (courtChain[matchId] || Promise.resolve()).then(async () => {
+            let lastErr = null;
+            for (let i = 0; i < 4; i++) {
+                try {
+                    const res = await fn();
+                    if (res && res.error) throw res.error;
+                    return res ? res.data : null;
+                } catch (e) { lastErr = e; await _sleep(300 * (i + 1) + Math.random() * 300); }
+            }
+            throw lastErr;
+        });
+        courtChain[matchId] = run.catch(() => {}).then(() => {
+            courtPending[matchId] = Math.max(0, (courtPending[matchId] || 1) - 1);
+            if (courtPending[matchId] === 0) courtRenderSoon();
+        });
+        return run.then(row => { if (row && row.match_id) courtScores[row.match_id] = row; return row; })
+                  .catch(err => { console.error('[COURT] gagal simpan skor lapangan:', err); markSyncError('Skor lapangan belum tersimpan. Periksa koneksi.'); loadCourtScores().then(courtRenderSoon); return null; });
+    }
+    function courtDrain(matchId) { return courtChain[matchId] || Promise.resolve(); }
 
     // Menerapkan SATU perubahan skor ke server berdasarkan data TERBARU di server.
     // Data pertandingan yang sedang dibuka disimpan di DUA tempat:
@@ -5070,6 +5171,7 @@ async function deletePicRole(roleId){
         // Update lokal dulu supaya tombol terasa instan, sekaligus ambil waktu
         // terbaru agar mutasi skor tidak menimpa timer server dengan nilai lama.
         const localMatch = activeMatches.find(m => m.id === matchId);
+        const _courtSeed = (COURT_ROWS && localMatch && !courtScores[matchId]) ? courtSeedFor(localMatch) : null;
         if(localMatch) {
             const p = localMatch[team] && localMatch[team][playerIdx];
             if(applyScoreChange(localMatch, p)) {
@@ -5082,6 +5184,17 @@ async function deletePicRole(roleId){
         const elapsedTime = Number(localMatch?.time || 0);
         const wasRunning = !!localMatch?.isRunning;
 
+        if (COURT_ROWS && localMatch) {
+            // Jalur baru: baris sendiri per lapangan, dihitung atomik di database.
+            courtEnqueue(matchId, async () => {
+                if (_courtSeed) {
+                    const sd = await supabaseClient.rpc('sm_court_seed', { p_match_id: matchId, p_a: _courtSeed.a, p_b: _courtSeed.b, p_players: _courtSeed.players });
+                    if (sd.error) return sd;
+                }
+                return supabaseClient.rpc('sm_court_apply', { p_match_id: matchId, p_team: team, p_idx: playerIdx, p_type: type, p_delta: delta });
+            });
+            return;
+        }
         // Simpan skor bersama waktu/status timer terkini dari layar ini.
         queueScoreOp(row => {
             const m = (row.active_matches || []).find(x => x.id === matchId);
@@ -5289,6 +5402,14 @@ async function deletePicRole(roleId){
             const newA = parseInt(sA) || 0, newB = parseInt(sB) || 0;
             match.scoreA = newA; match.scoreB = newB; // update lokal instan
             renderCourts(); if (window.scoreDashboardOpen) renderScoreDashboard(matchId);
+            if (COURT_ROWS) {
+                const seed = courtScores[matchId] ? null : courtSeedFor(match);
+                courtEnqueue(matchId, async () => {
+                    if (seed) { const sd = await supabaseClient.rpc('sm_court_seed', { p_match_id: matchId, p_a: seed.a, p_b: seed.b, p_players: seed.players }); if (sd.error) return sd; }
+                    return supabaseClient.rpc('sm_court_set', { p_match_id: matchId, p_a: newA, p_b: newB });
+                });
+                return;
+            }
             queueScoreOp(async () => {
                 const ok = await safeApplyToServer(row => {
                     const m = (row.active_matches || []).find(x => x.id === matchId);
@@ -5355,6 +5476,17 @@ async function deletePicRole(roleId){
         // Tanpa ini, finish bisa bentrok dengan batch skor yang masih berjalan.
         await flushScoreBatch();
         await scoreOpQueue;
+        // Pastikan semua ketukan skor lapangan ini sudah terkonfirmasi, lalu ambil skor FINAL dari server.
+        let finalCourt = null;
+        if (COURT_ROWS) {
+            await courtDrain(matchId);
+            const { data: fc, error: fcErr } = await supabaseClient.from('sm_court_score').select('*').eq('match_id', matchId).maybeSingle();
+            if (fcErr) {
+                markSyncError('Skor final belum bisa diambil dari server. Coba Selesaikan Match lagi.');
+                return false;
+            }
+            finalCourt = fc || null;
+        }
         const localMatch = activeMatches.find(m => m.id === matchId);
         if (!localMatch) return;
         const finishedCourtName = localMatch.courtName;
@@ -5371,6 +5503,7 @@ async function deletePicRole(roleId){
         const ok = await safeRoundMixMutation(view => {
             const match = view.activeMatches.find(m => m.id === matchId);
             if (!match) return false;
+            if (finalCourt) applyCourtRowToMatch(match, finalCourt);
 
             // Skor 0-0 berarti match belum dimulai: boleh ditutup, tetapi tidak masuk histori/statistik.
             const unplayedZeroScore = Number(match.scoreA || 0) === 0 && Number(match.scoreB || 0) === 0;
@@ -5439,6 +5572,7 @@ async function deletePicRole(roleId){
             markSyncError('Match belum tersimpan. Jangan refresh dulu, lalu coba Selesaikan Match lagi.');
             return false;
         }
+        if (COURT_ROWS) { delete courtScores[matchId]; supabaseClient.rpc('sm_court_clear', { p_match_id: matchId }).then(() => {}, () => {}); }
 
         const dashWasHere = window.scoreDashboardOpen && window.scoreDashboardMatchId === matchId;
         if (dashWasHere) closeScoreDashboard();
@@ -5606,6 +5740,7 @@ async function deletePicRole(roleId){
     }
 
     function renderScoreDashboard(matchId) {
+        applyCourtOverlay();
         const match = activeMatches.find(m => m.id === matchId);
         const content = document.getElementById('scoreDashboardContent');
         const courtEl = document.getElementById('scoreDashboardCourt');
@@ -5739,6 +5874,7 @@ async function deletePicRole(roleId){
     }
 
    function renderCourts() {
+    applyCourtOverlay();
     const container = document.getElementById('courtsContainer');
     if (!container) return;
 
@@ -8453,6 +8589,7 @@ async function generateBestPartnerStoryCard() {
         const startedAt = Date.now();
         try {
             await loadState();
+            await loadCourtScores();
         } catch (err) {
             console.error('Boot/loadState gagal:', err);
         }
@@ -8464,6 +8601,7 @@ async function generateBestPartnerStoryCard() {
         if (stateLoaded) {
             init();
             subscribeRealtime();
+            subscribeCourtRealtime();
             auraStartPresence(access);
             if (splash) {
                 splash.classList.add('hide');
