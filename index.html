@@ -3256,6 +3256,7 @@ async function deletePicRole(roleId){
     let courtViewId = null;
     let courtViewPref = true;       // true = buka tampilan lapangan; false = tampilan klasik (setelah menekan "Klasik")
     let courtPickServer = false;
+    let courtMenuKey = null;       // menu ⋮ yang sedang terbuka di panel pemain (mis. 'A0')
     let courtViewClock = null;
     const courtServeLocal = {};     // status servis sementara (optimis) selama ketukan belum terkonfirmasi
     const courtUndoStack = {};      // riwayat ketukan di HP ini, untuk tombol Undo
@@ -3300,11 +3301,12 @@ async function deletePicRole(roleId){
     }
     // Kotak di gambar: tim A di kiri (menghadap kanan): kanan = bawah. Tim B di kanan (menghadap kiri): kanan = atas.
     // swapped = true -> Tim B di kiri, Tim A di kanan (hanya tampilan; skor/servis/statistik tidak berubah).
+    // Lapangan digambar 520x320: dua kotak per sisi, garis tengah di x=260.
     function courtBoxRect(tl, side, swapped) {
         const isLeft = (tl === 'A') !== !!swapped;
-        const x = isLeft ? 40 : 520, w = 440, h = 175;
+        const x = isLeft ? 22 : 274, w = 224, h = 132;
         const bottom = isLeft === (side === 'R');
-        return { x, y: bottom ? 225 : 40, w, h };
+        return { x, y: bottom ? 166 : 22, w, h };
     }
 
     function ensureCourtView() {
@@ -3313,30 +3315,54 @@ async function deletePicRole(roleId){
         el = document.createElement('div');
         el.id = 'courtView';
         el.innerHTML = `<style>
-          #courtView{position:fixed;inset:0;z-index:99990;background:#06150f;color:#fff;display:none;overflow:hidden;touch-action:manipulation;-webkit-user-select:none;user-select:none}
+          #courtView{position:fixed;inset:0;z-index:99990;background:#04100b;color:#fff;display:none;overflow:hidden;touch-action:manipulation;-webkit-user-select:none;user-select:none}
           #courtView.show{display:block}
-          #courtView .cv-wrap{position:absolute;inset:0;display:flex;flex-direction:column;padding:max(6px,env(safe-area-inset-top)) max(8px,env(safe-area-inset-right)) max(6px,env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left));gap:6px;box-sizing:border-box}
+          #courtView button{margin:0}
+          #courtView .cv-wrap{position:absolute;inset:0;display:flex;flex-direction:column;padding:max(6px,env(safe-area-inset-top)) max(10px,env(safe-area-inset-right)) max(6px,env(safe-area-inset-bottom)) max(10px,env(safe-area-inset-left));gap:5px;box-sizing:border-box}
           @media (orientation:portrait){#courtView .cv-wrap{inset:auto;top:0;left:100%;width:100vh;width:100dvh;height:100vw;height:100dvw;transform-origin:top left;transform:rotate(90deg)}}
-          #courtView .cv-top{display:flex;align-items:center;gap:8px}
-          #courtView .cv-btn{background:#16352a;color:#fff;border:1px solid #2c6a52;border-radius:10px;padding:8px 12px;font-weight:700;font-size:14px;cursor:pointer}
-          #courtView .cv-btn.danger{background:#7a1f1f;border-color:#b53b3b}
+          #courtView .cv-top{display:flex;align-items:center;gap:6px}
+          #courtView .cv-btn{background:#12301f;color:#fff;border:1px solid #2c6a52;border-radius:9px;padding:7px 11px;font-weight:700;font-size:13px;cursor:pointer}
           #courtView .cv-btn.ok{background:#1f7a3f;border-color:#37b86a}
-          #courtView .cv-title{flex:1;text-align:center;font-weight:800;font-size:15px;line-height:1.2}
-          #courtView .cv-score{display:flex;align-items:center;justify-content:center;gap:14px}
-          #courtView .cv-team{flex:1;text-align:center;font-size:13px;opacity:.9;line-height:1.2}
+          #courtView .cv-title{flex:1;text-align:center;font-weight:800;font-size:13px;line-height:1.2;text-transform:uppercase;letter-spacing:.3px}
+          #courtView .cv-title #cvTime{font-weight:600;opacity:.85;margin-left:4px}
+          #courtView .cv-score{display:flex;align-items:center;justify-content:center;gap:12px}
+          #courtView .cv-team{flex:1;font-size:12px;line-height:1.25;opacity:.92}
+          #courtView .cv-team small{display:block;font-size:9px;font-weight:800;letter-spacing:.4px;color:#7fd6ff}
+          #courtView #cvTeamA{text-align:right}
+          #courtView #cvTeamB{text-align:left}
           #courtView .cv-team.srv{color:#ffd54a;opacity:1;font-weight:800}
-          #courtView .cv-num{font-size:clamp(40px,11vh,84px);font-weight:900;line-height:1;min-width:1.4em;text-align:center}
-          #courtView .cv-status{text-align:center;font-weight:800;font-size:15px;min-height:20px;color:#ffd54a}
-          #courtView .cv-note{text-align:center;font-size:13px;color:#9fe3b9;min-height:16px}
-          #courtView svg{flex:1;min-height:0;width:100%}
-          #courtView .cv-bot{display:flex;gap:8px;justify-content:space-between}
-          #courtView .cv-bot .cv-btn{flex:1;padding:12px 8px;font-size:15px}
-          #courtView .slot{cursor:pointer}
+          #courtView .cv-num{font-size:clamp(28px,9vh,54px);font-weight:900;line-height:1;min-width:1.2em;text-align:center}
+          #courtView .cv-status{text-align:center;font-weight:800;font-size:13px;color:#ffd54a}
+          #courtView .cv-status:empty,#courtView .cv-note:empty{display:none}
+          #courtView .cv-note{text-align:center;font-size:12px;color:#9fe3b9}
+          #courtView .cv-main{flex:1;min-height:0;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.15fr) minmax(0,1fr);gap:10px;align-items:center}
+          #courtView .cv-panel{display:flex;flex-direction:column;gap:6px;min-width:0}
+          #courtView .cv-plabel{font-size:10px;font-weight:900;letter-spacing:.6px;color:#ffd54a}
+          #courtView #cvPanelR .cv-plabel{text-align:right}
+          #courtView .cv-prow{position:relative;background:#0d2418;border:1px solid #2c6a52;border-radius:10px;padding:6px 8px}
+          #courtView .cv-ptop{display:flex;justify-content:space-between;align-items:baseline;gap:6px;margin-bottom:5px}
+          #courtView .cv-pnm{font-weight:800;font-size:14px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+          #courtView .cv-pst{font-size:10px;opacity:.85;white-space:nowrap}
+          #courtView .cv-pbtns{display:flex;gap:5px}
+          #courtView .cv-pbtns button{border:0;border-radius:8px;font-weight:800;font-size:12px;color:#fff;padding:9px 4px;line-height:1.1;cursor:pointer}
+          #courtView .cv-pt{background:#1f7a3f;flex:1}
+          #courtView .cv-fo{background:#9b2222;flex:1}
+          #courtView .cv-pbtns .cv-more{background:#12301f;border:1px solid #2c6a52;flex:0 0 34px}
+          #courtView .cv-menu{display:none;position:absolute;right:6px;top:100%;margin-top:2px;background:#fff;border-radius:8px;box-shadow:0 6px 18px rgba(0,0,0,.55);z-index:5;padding:3px;min-width:122px}
+          #courtView .cv-menu.up{top:auto;bottom:100%;margin-top:0;margin-bottom:2px}
+          #courtView .cv-menu.open{display:block}
+          #courtView .cv-menu button{display:block;width:100%;text-align:left;background:none;color:#111;border:0;border-radius:6px;padding:9px 10px;font-size:13px;font-weight:700;cursor:pointer}
+          #courtView .cv-menu button:active{background:#e6eef2}
+          #courtView svg{width:100%;height:100%;max-height:100%;min-height:0}
+          #courtView .cv-bot{display:flex;gap:8px}
+          #courtView .cv-bot .cv-btn{flex:1;padding:11px 8px;font-size:13px}
+          #courtView .slot.pick{cursor:pointer}
         </style>
         <div class="cv-wrap">
           <div class="cv-top">
             <button class="cv-btn" onclick="courtViewBack()">← Kembali</button>
-            <div class="cv-title"><div id="cvTitle">Lapangan</div><div id="cvTime" style="font-weight:600;opacity:.85"></div></div>
+            <div class="cv-title"><span id="cvTitle">Lapangan</span><span id="cvTime"></span></div>
+            <button class="cv-btn" id="cvSwapBtn" onclick="courtViewSwap()" title="Tukar sisi kiri/kanan">⇄ Tukar</button>
             <button class="cv-btn" id="cvTimerBtn" onclick="courtViewTimer()">⏱</button>
             <button class="cv-btn" onclick="courtViewClassic()">Klasik</button>
           </div>
@@ -3346,36 +3372,41 @@ async function deletePicRole(roleId){
             <div class="cv-num" id="cvScoreB">0</div><div class="cv-team" id="cvTeamB"></div>
           </div>
           <div class="cv-status" id="cvStatus"></div>
-          <svg id="cvSvg" viewBox="0 0 1000 420" preserveAspectRatio="xMidYMid meet">
-            <rect x="20" y="20" width="960" height="380" rx="14" fill="#14663f" stroke="#e8f5ec" stroke-width="5"/>
-            <line x1="500" y1="20" x2="500" y2="400" stroke="#fff" stroke-width="10" stroke-dasharray="3 9"/>
-            <line x1="20" y1="212" x2="980" y2="212" stroke="#e8f5ec" stroke-opacity=".5" stroke-width="3"/>
-            <rect id="cvRecv" x="0" y="0" width="440" height="175" rx="10" fill="none" stroke="#7fd6ff" stroke-width="5" stroke-dasharray="14 10" style="transition:all .5s ease"/>
-            <g id="cvSlots"></g>
-            <g id="cvBall" style="transition:transform .7s cubic-bezier(.3,1.5,.5,1)" transform="translate(500,210)">
-              <circle r="30" fill="#ffd54a" fill-opacity=".25"><animate attributeName="r" values="26;38;26" dur="1.4s" repeatCount="indefinite"/></circle>
-              <text text-anchor="middle" dominant-baseline="central" font-size="44">🏸</text>
-            </g>
-          </svg>
+          <div class="cv-main">
+            <div class="cv-panel" id="cvPanelL"></div>
+            <svg id="cvSvg" viewBox="0 0 520 320" preserveAspectRatio="xMidYMid meet">
+              <rect x="8" y="8" width="504" height="304" rx="16" fill="#0f5a3a" stroke="#d8efe2" stroke-width="4"/>
+              <line x1="260" y1="8" x2="260" y2="312" stroke="#fff" stroke-width="6" stroke-dasharray="2 9" stroke-linecap="round"/>
+              <rect id="cvRecv" x="0" y="0" width="224" height="132" rx="12" fill="none" stroke="#cfe9ff" stroke-width="4" stroke-dasharray="12 8" style="transition:all .4s ease"/>
+              <g id="cvSlots"></g>
+              <g id="cvBall" style="transition:transform .5s ease" transform="translate(40,280)">
+                <circle r="15" fill="#ffd54a"/>
+                <text text-anchor="middle" dominant-baseline="central" font-size="17">🏸</text>
+                <text x="22" y="1" dominant-baseline="central" font-size="14" font-weight="800" fill="#ffd54a">SERVIS</text>
+              </g>
+            </svg>
+            <div class="cv-panel" id="cvPanelR"></div>
+          </div>
           <div class="cv-note" id="cvNote"></div>
           <div class="cv-bot">
-            <button class="cv-btn" onclick="courtViewUndo()">↩ Undo</button>
-            <button class="cv-btn" id="cvSwapBtn" onclick="courtViewSwap()">⇄ Tukar sisi</button>
-            <button class="cv-btn" id="cvPickBtn" onclick="courtViewTogglePick()">🔄 Ubah server</button>
-            <button class="cv-btn ok" onclick="courtViewFinish()">✓ Selesaikan Match</button>
+            <button class="cv-btn" onclick="courtViewUndo()">Undo</button>
+            <button class="cv-btn" id="cvPickBtn" onclick="courtViewTogglePick()">Ubah server</button>
+            <button class="cv-btn ok" onclick="courtViewFinish()">Selesaikan Match</button>
           </div>
         </div>`;
         document.body.appendChild(el);
-        // Slot kotak: 2 per tim (kanan/kiri), dibuat sekali lalu hanya diperbarui isinya.
+        // Tutup menu ⋮ kalau mengetuk di luar menu.
+        el.addEventListener('click', ev => {
+            if (courtMenuKey && !ev.target.closest('.cv-more, .cv-menu')) { courtMenuKey = null; renderCourtView(); }
+        });
+        // Kotak pemain di lapangan: hanya tampilan (dan dipakai memilih server). Tanpa tombol statistik di dalamnya.
         const g = el.querySelector('#cvSlots'); let h = '';
         ['A', 'B'].forEach(tl => ['R', 'L'].forEach(sd => {
-            const b = courtBoxRect(tl, sd);
+            const b = courtBoxRect(tl, sd, false);
             h += `<g class="slot" id="cvslot-${tl}-${sd}" style="display:none">
-              <rect class="cvs-box" x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" rx="12" fill="${tl === 'A' ? '#1c7fb8' : '#c2571a'}" fill-opacity=".35" stroke="#fff" stroke-opacity=".6" stroke-width="3"/>
-              <text class="cvs-name" x="${b.x + b.w / 2}" y="${b.y + 78}" text-anchor="middle" font-size="42" font-weight="800" fill="#fff"></text>
-              <text class="cvs-stat" x="${b.x + b.w / 2}" y="${b.y + 122}" text-anchor="middle" font-size="26" fill="#d6f5e3"></text>
-              <text class="cvs-side" x="${b.x + 16}" y="${b.y + 32}" font-size="22" fill="#fff" fill-opacity=".7">${sd === 'R' ? 'KANAN' : 'KIRI'}</text>
-              <g class="cvs-err"><circle cx="${b.x + b.w - 38}" cy="${b.y + 38}" r="26" fill="#7a1f1f" stroke="#fff" stroke-opacity=".8" stroke-width="3"/><text x="${b.x + b.w - 38}" y="${b.y + 39}" text-anchor="middle" dominant-baseline="central" font-size="26" fill="#fff">✖</text></g>
+              <rect class="cvs-box" x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" rx="12" fill="#1b8079" stroke="#fff" stroke-opacity=".6" stroke-width="3"/>
+              <text class="cvs-side" x="${b.x + 12}" y="${b.y + 22}" font-size="14" font-weight="700" fill="#fff" fill-opacity=".75">${sd === 'R' ? 'KANAN' : 'KIRI'}</text>
+              <text class="cvs-name" x="${b.x + b.w / 2}" y="${b.y + b.h / 2 + 12}" text-anchor="middle" font-size="36" font-weight="800" fill="#fff"></text>
             </g>`;
         }));
         g.innerHTML = h;
@@ -3401,7 +3432,7 @@ async function deletePicRole(roleId){
     function closeCourtView() {
         const el = document.getElementById('courtView');
         if (el) el.classList.remove('show');
-        courtViewId = null; courtPickServer = false;
+        courtViewId = null; courtPickServer = false; courtMenuKey = null;
         clearInterval(courtViewClock); courtViewClock = null;
         try { screen.orientation && screen.orientation.unlock && screen.orientation.unlock(); } catch (e) {}
         try { if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {}); } catch (e) {}
@@ -3427,67 +3458,90 @@ async function deletePicRole(roleId){
         const el = ensureCourtView();
         const sv = courtServeOf(m.id), on = !!(sv && sv.on);
         const lay = courtLayout(m, sv);
-        const names = tl => (m['team' + tl] || []).map(p => p.name).join(' & ');
+        const names = tl => (m['team' + tl] || []).map(p => escapeHTML(p.name)).join(' &amp; ');
         const idx = activeMatches.indexOf(m);
-        el.querySelector('#cvTitle').textContent = `${m.courtName || ('Lapangan ' + (idx + 1))} · Ronde ${m.round || 1}`;
-        // Sisi tampilan (kiri/kanan) bisa ditukar; elemen cv*A = sisi KIRI, cv*B = sisi KANAN.
+        el.querySelector('#cvTitle').textContent = `${m.courtName || ('Lapangan ' + (idx + 1))} - Ronde ${m.round || 1}`;
+
+        // Sisi tampilan bisa ditukar: KIRI/KANAN hanya posisi layar. Skor, servis, dan statistik tetap milik timnya.
         const swp = scoreSwapOf(m.id), leftTl = swp ? 'B' : 'A', rightTl = swp ? 'A' : 'B';
         el.querySelector('#cvScoreA').textContent = courtScoreOfTeam(m, leftTl);
         el.querySelector('#cvScoreB').textContent = courtScoreOfTeam(m, rightTl);
         const tA = el.querySelector('#cvTeamA'), tB = el.querySelector('#cvTeamB');
-        tA.textContent = names(leftTl); tB.textContent = names(rightTl);
+        tA.innerHTML = `<small>TIM KIRI</small>${names(leftTl)}`;
+        tB.innerHTML = `<small>TIM KANAN</small>${names(rightTl)}`;
         tA.classList.toggle('srv', !!(lay.server && lay.server.tl === leftTl));
         tB.classList.toggle('srv', !!(lay.server && lay.server.tl === rightTl));
-        const sb = el.querySelector('#cvSwapBtn');
-        if (sb) sb.textContent = swp ? '⇄ Tukar sisi (B di kiri)' : '⇄ Tukar sisi (A di kiri)';
 
-        // slot pemain
+        // Panel pemain di samping lapangan: + Point / + Fault/Out langsung, koreksi di menu ⋮.
+        const panelHTML = (tl, label) => `<div class="cv-plabel">TIM ${label}</div>` + (m['team' + tl] || []).map((p, i) => {
+            const key = tl + i;
+            return `<div class="cv-prow">
+              <div class="cv-ptop"><span class="cv-pnm">${escapeHTML(p.name)}</span><span class="cv-pst">P${Number(p.matchPoints || 0)} · F/O ${Number(p.matchOuts || 0) + Number(p.matchFaults || 0)}</span></div>
+              <div class="cv-pbtns">
+                <button type="button" class="cv-pt" onclick="courtViewPoint('${tl}',${i})">+ Point</button>
+                <button type="button" class="cv-fo" onclick="courtViewError('${tl}',${i})">+ Fault/Out</button>
+                <button type="button" class="cv-more" aria-label="Koreksi" onclick="courtViewMenu(event,'${key}')">⋮</button>
+              </div>
+              <div class="cv-menu${courtMenuKey === key ? ' open' : ''}${i > 0 ? ' up' : ''}">
+                <button type="button" onclick="courtViewMinus('${tl}',${i},'point')">− Point</button>
+                <button type="button" onclick="courtViewMinus('${tl}',${i},'error')">− Fault/Out</button>
+              </div>
+            </div>`;
+        }).join('');
+        [['#cvPanelL', leftTl, 'KIRI'], ['#cvPanelR', rightTl, 'KANAN']].forEach(([sel, tl, label]) => {
+            const box = el.querySelector(sel), html = panelHTML(tl, label);
+            if (box.dataset.h !== html) { box.innerHTML = html; box.dataset.h = html; }
+        });
+
+        // kotak pemain di lapangan
+        const pickable = !on || courtPickServer;
         ['A', 'B'].forEach(tl => ['R', 'L'].forEach(sd => { el.querySelector(`#cvslot-${tl}-${sd}`).style.display = 'none'; }));
         ['A', 'B'].forEach(tl => {
             (lay.slots[tl] || []).forEach(s => {
                 const p = (m['team' + tl] || [])[s.idx]; if (!p) return;
                 const g = el.querySelector(`#cvslot-${tl}-${s.side}`); g.style.display = '';
-                { const r0 = courtBoxRect(tl, s.side, false), r1 = courtBoxRect(tl, s.side, swp); g.setAttribute('transform', `translate(${r1.x - r0.x},${r1.y - r0.y})`); }
-                const nm = String(p.name || ''); g.querySelector('.cvs-name').textContent = nm.length > 14 ? nm.slice(0, 13) + '…' : nm;
-                g.querySelector('.cvs-stat').textContent = `P${Number(p.matchPoints || 0)} · ✖${Number(p.matchOuts || 0) + Number(p.matchFaults || 0)}`;
+                const r0 = courtBoxRect(tl, s.side, false), r1 = courtBoxRect(tl, s.side, swp);
+                g.setAttribute('transform', `translate(${r1.x - r0.x},${r1.y - r0.y})`);
+                const nm = String(p.name || ''); g.querySelector('.cvs-name').textContent = nm.length > 12 ? nm.slice(0, 11) + '…' : nm;
                 const isSrv = lay.server && lay.server.tl === tl && lay.server.idx === s.idx;
-                g.querySelector('.cvs-box').setAttribute('stroke', isSrv ? '#ffd54a' : '#ffffff');
-                g.querySelector('.cvs-box').setAttribute('stroke-width', isSrv ? '7' : '3');
-                g.querySelector('.cvs-err').style.display = (on && !courtPickServer) ? '' : 'none';
-                g.querySelector('.cvs-box').onclick = g.querySelector('.cvs-name').onclick = g.querySelector('.cvs-stat').onclick = () => courtViewTap(tl, s.idx);
-                g.querySelector('.cvs-err').onclick = ev => { ev.stopPropagation(); courtViewError(tl, s.idx); };
+                const box = g.querySelector('.cvs-box');
+                box.setAttribute('fill', tl === leftTl ? '#1b8079' : '#66742f');
+                box.setAttribute('stroke', isSrv ? '#ffd54a' : '#ffffff');
+                box.setAttribute('stroke-width', isSrv ? '6' : '3');
+                g.classList.toggle('pick', pickable);
+                box.onclick = g.querySelector('.cvs-name').onclick = () => courtViewTap(tl, s.idx);
             });
         });
 
-        // bola + penerima
+        // penanda servis + kotak penerima
         const ball = el.querySelector('#cvBall'), recv = el.querySelector('#cvRecv');
         if (lay.server) {
             const b = courtBoxRect(lay.server.tl, lay.server.side, swp);
-            ball.style.display = ''; ball.setAttribute('transform', `translate(${b.x + 70},${b.y + b.h - 38})`);
+            ball.style.display = ''; ball.setAttribute('transform', `translate(${b.x + 24},${b.y + b.h - 20})`);
             const otl = lay.server.tl === 'A' ? 'B' : 'A', rb = courtBoxRect(otl, lay.recvSide, swp);
             recv.style.display = ''; recv.setAttribute('x', rb.x); recv.setAttribute('y', rb.y);
         } else { ball.style.display = 'none'; recv.style.display = 'none'; }
 
         // status
         const st = el.querySelector('#cvStatus'), note = el.querySelector('#cvNote');
-        if (!on || courtPickServer) {
-            st.textContent = on ? 'Ketuk pemain yang SERVIS sekarang' : 'Ketuk pemain yang servis PERTAMA';
-            note.textContent = on ? '' : 'Setelah dipilih, bola dan posisi pemain bergerak otomatis tiap poin.';
+        if (pickable) {
+            st.textContent = on ? 'Ketuk kotak pemain yang SERVIS sekarang' : 'Ketuk kotak pemain yang servis PERTAMA';
+            note.textContent = '';
         } else {
-            const sp = (m['team' + lay.server.tl] || [])[lay.server.idx];
-            st.textContent = `🏸 SERVIS: ${sp ? sp.name : '?'} · kotak ${lay.server.side === 'R' ? 'KANAN' : 'KIRI'}`;
+            st.textContent = '';
             const a = Number(m.scoreA || 0), b = Number(m.scoreB || 0), hi = Math.max(a, b);
-            note.textContent = ((hi >= 21 && Math.abs(a - b) >= 2) || hi >= 30) ? '✅ Skor akhir game tercapai. Tekan "Selesaikan Match" jika pertandingan sudah berakhir.' : 'Ketuk kotak pemain = +poin · tombol ✖ = out/fault (poin ke lawan)';
+            note.textContent = ((hi >= 21 && Math.abs(a - b) >= 2) || hi >= 30) ? '✅ Skor akhir game tercapai. Tekan "Selesaikan Match" jika pertandingan sudah berakhir.' : '';
         }
-        el.querySelector('#cvPickBtn').textContent = courtPickServer ? '✕ Batal' : '🔄 Ubah server';
+        el.querySelector('#cvPickBtn').textContent = courtPickServer ? '✕ Batal' : 'Ubah server';
         courtViewTick();
     }
 
+    // Mengetuk kotak pemain di lapangan HANYA dipakai untuk memilih server (bukan untuk menambah statistik).
     function courtViewTap(tl, idx) {
         const m = activeMatches.find(x => x.id === courtViewId); if (!m) return;
-        try { navigator.vibrate && navigator.vibrate(15); } catch (e) {}
         const sv = courtServeOf(m.id);
         if (!(sv && sv.on) || courtPickServer) {          // memilih server
+            try { navigator.vibrate && navigator.vibrate(15); } catch (e) {}
             const sc = courtScoreOfTeam(m, tl), r = { A: 0, B: 0 };
             r[tl] = sc % 2 === 0 ? idx : 1 - idx;
             courtServeLocal[m.id] = { on: true, st: tl, r, h: [] };
@@ -3497,8 +3551,13 @@ async function deletePicRole(roleId){
                 if (seed) { const sd = await supabaseClient.rpc('sm_court_seed', { p_match_id: m.id, p_a: seed.a, p_b: seed.b, p_players: seed.players }); if (sd.error) return sd; }
                 return supabaseClient.rpc('sm_court_serve_set', { p_match_id: m.id, p_st: tl, p_idx: idx });
             });
-            renderCourtView(); return;
+            renderCourtView();
         }
+    }
+    function courtViewPoint(tl, idx) {
+        const m = activeMatches.find(x => x.id === courtViewId); if (!m) return;
+        try { navigator.vibrate && navigator.vibrate(15); } catch (e) {}
+        courtMenuKey = null;
         (courtUndoStack[m.id] = courtUndoStack[m.id] || []).push({ team: 'team' + tl, idx, type: 'point' });
         updateScore(m.id, 'team' + tl, idx, 'point', false);
         renderCourtView();
@@ -3506,8 +3565,21 @@ async function deletePicRole(roleId){
     function courtViewError(tl, idx) {
         const m = activeMatches.find(x => x.id === courtViewId); if (!m) return;
         try { navigator.vibrate && navigator.vibrate(25); } catch (e) {}
+        courtMenuKey = null;
         (courtUndoStack[m.id] = courtUndoStack[m.id] || []).push({ team: 'team' + tl, idx, type: 'error' });
         updateScore(m.id, 'team' + tl, idx, 'error', false);
+        renderCourtView();
+    }
+    // Koreksi (salah tekan) dari menu ⋮: − Point / − Fault/Out. Tidak pernah di bawah 0 (dijaga updateScore).
+    function courtViewMinus(tl, idx, type) {
+        const m = activeMatches.find(x => x.id === courtViewId); if (!m) return;
+        courtMenuKey = null;
+        updateScore(m.id, 'team' + tl, idx, type, true);
+        renderCourtView();
+    }
+    function courtViewMenu(ev, key) {
+        if (ev) ev.stopPropagation();
+        courtMenuKey = (courtMenuKey === key) ? null : key;
         renderCourtView();
     }
     function courtViewUndo() {
