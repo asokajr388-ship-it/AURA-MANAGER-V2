@@ -3197,6 +3197,7 @@ async function deletePicRole(roleId){
         courtRenderTimer = setTimeout(() => {
             applyCourtOverlay();
             try { renderCourts(); } catch (e) {}
+            try { renderCourtView(); } catch (e) {}
             try {
                 if (window.scoreDashboardOpen && window.scoreDashboardMatchId) renderScoreDashboard(window.scoreDashboardMatchId);
             } catch (e) {}
@@ -3238,12 +3239,281 @@ async function deletePicRole(roleId){
         });
         courtChain[matchId] = run.catch(() => {}).then(() => {
             courtPending[matchId] = Math.max(0, (courtPending[matchId] || 1) - 1);
-            if (courtPending[matchId] === 0) courtRenderSoon();
+            if (courtPending[matchId] === 0) setTimeout(() => { if (!courtPending[matchId]) delete courtServeLocal[matchId]; courtRenderSoon(); }, 60);
         });
         return run.then(row => { if (row && row.match_id) courtScores[row.match_id] = row; return row; })
                   .catch(err => { console.error('[COURT] gagal simpan skor lapangan:', err); markSyncError('Skor lapangan belum tersimpan. Periksa koneksi.'); loadCourtScores().then(courtRenderSoon); return null; });
     }
     function courtDrain(matchId) { return courtChain[matchId] || Promise.resolve(); }
+
+    // ============================================================================
+    // TAMPILAN LAPANGAN (landscape) + PELACAK SERVIS
+    // Posisi bola dihitung dari aturan ganda badminton: tim yang menang reli servis berikutnya;
+    // server di kotak kanan bila skor timnya genap, kiri bila ganjil; pemain satu tim bertukar
+    // sisi hanya saat timnya mencetak poin sambil servis. Status servis disimpan di baris
+    // lapangan yang sama (kolom serve), jadi semua HP melihat posisi bola yang sama.
+    // ============================================================================
+    let courtViewId = null;
+    let courtViewPref = true;       // true = buka tampilan lapangan; false = tampilan klasik (setelah menekan "Klasik")
+    let courtPickServer = false;
+    let courtViewClock = null;
+    const courtServeLocal = {};     // status servis sementara (optimis) selama ketukan belum terkonfirmasi
+    const courtUndoStack = {};      // riwayat ketukan di HP ini, untuk tombol Undo
+
+    function courtServeOf(id) { return courtServeLocal[id] || (courtScores[id] && courtScores[id].serve) || null; }
+    // Cermin persis logika sm_court_apply di database.
+    function courtServeStep(sv, w, d) {
+        if (!sv || !sv.on) return sv;
+        const c = JSON.parse(JSON.stringify(sv)); c.h = c.h || [];
+        if (d > 0) {
+            c.h.push({ st: c.st, r: { ...c.r }, w });
+            if (c.h.length > 80) c.h.shift();
+            if (c.st === w) c.r[w] = 1 - (c.r[w] || 0);
+            c.st = w; return c;
+        }
+        const last = c.h[c.h.length - 1];
+        if (last && last.w === w) { c.h.pop(); c.st = last.st; c.r = { ...last.r }; }
+        return c;
+    }
+    function courtScoreOfTeam(m, tl) { return Number(tl === 'A' ? m.scoreA : m.scoreB) || 0; }
+    function courtLayout(m, sv) {
+        // Hasil: { slots:{A:[{idx,side}],B:[...]}, server:{tl,idx,side}|null, recvSide }
+        const on = !!(sv && sv.on);
+        const out = { slots: { A: [], B: [] }, server: null, recvSide: null };
+        let sideForSingles = null;
+        if (on) {
+            const st = sv.st, team = m['team' + st] || [], sc = courtScoreOfTeam(m, st);
+            const side = sc % 2 === 0 ? 'R' : 'L';
+            const idx = team.length < 2 ? 0 : (sc % 2 === 0 ? (sv.r[st] || 0) : 1 - (sv.r[st] || 0));
+            out.server = { tl: st, idx, side }; out.recvSide = side; sideForSingles = side;
+        }
+        ['A', 'B'].forEach(tl => {
+            const team = m['team' + tl] || [], sc = courtScoreOfTeam(m, tl);
+            if (team.length < 2) {
+                if (team.length) out.slots[tl] = [{ idx: 0, side: sideForSingles || (sc % 2 === 0 ? 'R' : 'L') }];
+            } else {
+                const rIdx = on ? (sv.r[tl] || 0) : 0;
+                out.slots[tl] = [{ idx: rIdx, side: 'R' }, { idx: 1 - rIdx, side: 'L' }];
+            }
+        });
+        return out;
+    }
+    // Kotak di gambar: tim A di kiri (menghadap kanan): kanan = bawah. Tim B di kanan (menghadap kiri): kanan = atas.
+    function courtBoxRect(tl, side) {
+        const x = tl === 'A' ? 40 : 520, w = 440, h = 175;
+        const bottom = (tl === 'A') === (side === 'R');
+        return { x, y: bottom ? 225 : 40, w, h };
+    }
+
+    function ensureCourtView() {
+        let el = document.getElementById('courtView');
+        if (el) return el;
+        el = document.createElement('div');
+        el.id = 'courtView';
+        el.innerHTML = `<style>
+          #courtView{position:fixed;inset:0;z-index:99990;background:#06150f;color:#fff;display:none;overflow:hidden;touch-action:manipulation;-webkit-user-select:none;user-select:none}
+          #courtView.show{display:block}
+          #courtView .cv-wrap{position:absolute;inset:0;display:flex;flex-direction:column;padding:max(6px,env(safe-area-inset-top)) max(8px,env(safe-area-inset-right)) max(6px,env(safe-area-inset-bottom)) max(8px,env(safe-area-inset-left));gap:6px;box-sizing:border-box}
+          @media (orientation:portrait){#courtView .cv-wrap{inset:auto;top:0;left:100%;width:100vh;width:100dvh;height:100vw;height:100dvw;transform-origin:top left;transform:rotate(90deg)}}
+          #courtView .cv-top{display:flex;align-items:center;gap:8px}
+          #courtView .cv-btn{background:#16352a;color:#fff;border:1px solid #2c6a52;border-radius:10px;padding:8px 12px;font-weight:700;font-size:14px;cursor:pointer}
+          #courtView .cv-btn.danger{background:#7a1f1f;border-color:#b53b3b}
+          #courtView .cv-btn.ok{background:#1f7a3f;border-color:#37b86a}
+          #courtView .cv-title{flex:1;text-align:center;font-weight:800;font-size:15px;line-height:1.2}
+          #courtView .cv-score{display:flex;align-items:center;justify-content:center;gap:14px}
+          #courtView .cv-team{flex:1;text-align:center;font-size:13px;opacity:.9;line-height:1.2}
+          #courtView .cv-team.srv{color:#ffd54a;opacity:1;font-weight:800}
+          #courtView .cv-num{font-size:clamp(40px,11vh,84px);font-weight:900;line-height:1;min-width:1.4em;text-align:center}
+          #courtView .cv-status{text-align:center;font-weight:800;font-size:15px;min-height:20px;color:#ffd54a}
+          #courtView .cv-note{text-align:center;font-size:13px;color:#9fe3b9;min-height:16px}
+          #courtView svg{flex:1;min-height:0;width:100%}
+          #courtView .cv-bot{display:flex;gap:8px;justify-content:space-between}
+          #courtView .cv-bot .cv-btn{flex:1;padding:12px 8px;font-size:15px}
+          #courtView .slot{cursor:pointer}
+        </style>
+        <div class="cv-wrap">
+          <div class="cv-top">
+            <button class="cv-btn" onclick="courtViewBack()">← Kembali</button>
+            <div class="cv-title"><div id="cvTitle">Lapangan</div><div id="cvTime" style="font-weight:600;opacity:.85"></div></div>
+            <button class="cv-btn" id="cvTimerBtn" onclick="courtViewTimer()">⏱</button>
+            <button class="cv-btn" onclick="courtViewClassic()">Klasik</button>
+          </div>
+          <div class="cv-score">
+            <div class="cv-team" id="cvTeamA"></div><div class="cv-num" id="cvScoreA">0</div>
+            <div class="cv-num" style="min-width:.6em;opacity:.6">–</div>
+            <div class="cv-num" id="cvScoreB">0</div><div class="cv-team" id="cvTeamB"></div>
+          </div>
+          <div class="cv-status" id="cvStatus"></div>
+          <svg id="cvSvg" viewBox="0 0 1000 420" preserveAspectRatio="xMidYMid meet">
+            <rect x="20" y="20" width="960" height="380" rx="14" fill="#14663f" stroke="#e8f5ec" stroke-width="5"/>
+            <line x1="500" y1="20" x2="500" y2="400" stroke="#fff" stroke-width="10" stroke-dasharray="3 9"/>
+            <line x1="20" y1="212" x2="980" y2="212" stroke="#e8f5ec" stroke-opacity=".5" stroke-width="3"/>
+            <rect id="cvRecv" x="0" y="0" width="440" height="175" rx="10" fill="none" stroke="#7fd6ff" stroke-width="5" stroke-dasharray="14 10" style="transition:all .5s ease"/>
+            <g id="cvSlots"></g>
+            <g id="cvBall" style="transition:transform .7s cubic-bezier(.3,1.5,.5,1)" transform="translate(500,210)">
+              <circle r="30" fill="#ffd54a" fill-opacity=".25"><animate attributeName="r" values="26;38;26" dur="1.4s" repeatCount="indefinite"/></circle>
+              <text text-anchor="middle" dominant-baseline="central" font-size="44">🏸</text>
+            </g>
+          </svg>
+          <div class="cv-note" id="cvNote"></div>
+          <div class="cv-bot">
+            <button class="cv-btn" onclick="courtViewUndo()">↩ Undo</button>
+            <button class="cv-btn" id="cvPickBtn" onclick="courtViewTogglePick()">🔄 Ubah server</button>
+            <button class="cv-btn ok" onclick="courtViewFinish()">✓ Selesaikan Match</button>
+          </div>
+        </div>`;
+        document.body.appendChild(el);
+        // Slot kotak: 2 per tim (kanan/kiri), dibuat sekali lalu hanya diperbarui isinya.
+        const g = el.querySelector('#cvSlots'); let h = '';
+        ['A', 'B'].forEach(tl => ['R', 'L'].forEach(sd => {
+            const b = courtBoxRect(tl, sd);
+            h += `<g class="slot" id="cvslot-${tl}-${sd}" style="display:none">
+              <rect class="cvs-box" x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" rx="12" fill="${tl === 'A' ? '#1c7fb8' : '#c2571a'}" fill-opacity=".35" stroke="#fff" stroke-opacity=".6" stroke-width="3"/>
+              <text class="cvs-name" x="${b.x + b.w / 2}" y="${b.y + 78}" text-anchor="middle" font-size="42" font-weight="800" fill="#fff"></text>
+              <text class="cvs-stat" x="${b.x + b.w / 2}" y="${b.y + 122}" text-anchor="middle" font-size="26" fill="#d6f5e3"></text>
+              <text class="cvs-side" x="${b.x + 16}" y="${b.y + 32}" font-size="22" fill="#fff" fill-opacity=".7">${sd === 'R' ? 'KANAN' : 'KIRI'}</text>
+              <g class="cvs-err"><circle cx="${b.x + b.w - 38}" cy="${b.y + 38}" r="26" fill="#7a1f1f" stroke="#fff" stroke-opacity=".8" stroke-width="3"/><text x="${b.x + b.w - 38}" y="${b.y + 39}" text-anchor="middle" dominant-baseline="central" font-size="26" fill="#fff">✖</text></g>
+            </g>`;
+        }));
+        g.innerHTML = h;
+        return el;
+    }
+
+    function openCourtView(matchId) {
+        if (!COURT_ROWS) return;
+        const el = ensureCourtView();
+        courtViewId = matchId; courtPickServer = false;
+        el.classList.add('show');
+        try {
+            if (window.matchMedia && matchMedia('(pointer:coarse)').matches && document.documentElement.requestFullscreen && !document.fullscreenElement) {
+                document.documentElement.requestFullscreen().then(() => {
+                    try { screen.orientation && screen.orientation.lock && screen.orientation.lock('landscape').catch(() => {}); } catch (e) {}
+                }).catch(() => {});
+            } else if (screen.orientation && screen.orientation.lock) { screen.orientation.lock('landscape').catch(() => {}); }
+        } catch (e) {}
+        clearInterval(courtViewClock);
+        courtViewClock = setInterval(courtViewTick, 500);
+        renderCourtView();
+    }
+    function closeCourtView() {
+        const el = document.getElementById('courtView');
+        if (el) el.classList.remove('show');
+        courtViewId = null; courtPickServer = false;
+        clearInterval(courtViewClock); courtViewClock = null;
+        try { screen.orientation && screen.orientation.unlock && screen.orientation.unlock(); } catch (e) {}
+        try { if (document.fullscreenElement && document.exitFullscreen) document.exitFullscreen().catch(() => {}); } catch (e) {}
+    }
+    function courtViewTick() {
+        if (!courtViewId) return;
+        const m = activeMatches.find(x => x.id === courtViewId);
+        const t = document.getElementById('cvTime');
+        if (m && t) {
+            let secs = Number(m.time || 0);
+            try { secs = roundMixElapsed(m.id, m.time); } catch (e) {}
+            t.textContent = '⏱ ' + formatTime(Math.max(0, Math.floor(secs)));
+            const b = document.getElementById('cvTimerBtn');
+            const running = !!(roundMixTimerRuntime[m.id] && roundMixTimerRuntime[m.id].running);
+            if (b) b.textContent = running ? '⏸ Pause' : '▶ Mulai';
+        }
+    }
+
+    function renderCourtView() {
+        if (!courtViewId) return;
+        const m = activeMatches.find(x => x.id === courtViewId);
+        if (!m) { closeCourtView(); return; }
+        const el = ensureCourtView();
+        const sv = courtServeOf(m.id), on = !!(sv && sv.on);
+        const lay = courtLayout(m, sv);
+        const names = tl => (m['team' + tl] || []).map(p => p.name).join(' & ');
+        const idx = activeMatches.indexOf(m);
+        el.querySelector('#cvTitle').textContent = `${m.courtName || ('Lapangan ' + (idx + 1))} · Ronde ${m.round || 1}`;
+        el.querySelector('#cvScoreA').textContent = Number(m.scoreA || 0);
+        el.querySelector('#cvScoreB').textContent = Number(m.scoreB || 0);
+        const tA = el.querySelector('#cvTeamA'), tB = el.querySelector('#cvTeamB');
+        tA.textContent = names('A'); tB.textContent = names('B');
+        tA.classList.toggle('srv', !!(lay.server && lay.server.tl === 'A'));
+        tB.classList.toggle('srv', !!(lay.server && lay.server.tl === 'B'));
+
+        // slot pemain
+        ['A', 'B'].forEach(tl => ['R', 'L'].forEach(sd => { el.querySelector(`#cvslot-${tl}-${sd}`).style.display = 'none'; }));
+        ['A', 'B'].forEach(tl => {
+            (lay.slots[tl] || []).forEach(s => {
+                const p = (m['team' + tl] || [])[s.idx]; if (!p) return;
+                const g = el.querySelector(`#cvslot-${tl}-${s.side}`); g.style.display = '';
+                const nm = String(p.name || ''); g.querySelector('.cvs-name').textContent = nm.length > 14 ? nm.slice(0, 13) + '…' : nm;
+                g.querySelector('.cvs-stat').textContent = `P${Number(p.matchPoints || 0)} · ✖${Number(p.matchOuts || 0) + Number(p.matchFaults || 0)}`;
+                const isSrv = lay.server && lay.server.tl === tl && lay.server.idx === s.idx;
+                g.querySelector('.cvs-box').setAttribute('stroke', isSrv ? '#ffd54a' : '#ffffff');
+                g.querySelector('.cvs-box').setAttribute('stroke-width', isSrv ? '7' : '3');
+                g.querySelector('.cvs-err').style.display = (on && !courtPickServer) ? '' : 'none';
+                g.querySelector('.cvs-box').onclick = g.querySelector('.cvs-name').onclick = g.querySelector('.cvs-stat').onclick = () => courtViewTap(tl, s.idx);
+                g.querySelector('.cvs-err').onclick = ev => { ev.stopPropagation(); courtViewError(tl, s.idx); };
+            });
+        });
+
+        // bola + penerima
+        const ball = el.querySelector('#cvBall'), recv = el.querySelector('#cvRecv');
+        if (lay.server) {
+            const b = courtBoxRect(lay.server.tl, lay.server.side);
+            ball.style.display = ''; ball.setAttribute('transform', `translate(${b.x + 70},${b.y + b.h - 38})`);
+            const otl = lay.server.tl === 'A' ? 'B' : 'A', rb = courtBoxRect(otl, lay.recvSide);
+            recv.style.display = ''; recv.setAttribute('x', rb.x); recv.setAttribute('y', rb.y);
+        } else { ball.style.display = 'none'; recv.style.display = 'none'; }
+
+        // status
+        const st = el.querySelector('#cvStatus'), note = el.querySelector('#cvNote');
+        if (!on || courtPickServer) {
+            st.textContent = on ? 'Ketuk pemain yang SERVIS sekarang' : 'Ketuk pemain yang servis PERTAMA';
+            note.textContent = on ? '' : 'Setelah dipilih, bola dan posisi pemain bergerak otomatis tiap poin.';
+        } else {
+            const sp = (m['team' + lay.server.tl] || [])[lay.server.idx];
+            st.textContent = `🏸 SERVIS: ${sp ? sp.name : '?'} · kotak ${lay.server.side === 'R' ? 'KANAN' : 'KIRI'}`;
+            const a = Number(m.scoreA || 0), b = Number(m.scoreB || 0), hi = Math.max(a, b);
+            note.textContent = ((hi >= 21 && Math.abs(a - b) >= 2) || hi >= 30) ? '✅ Skor akhir game tercapai. Tekan "Selesaikan Match" jika pertandingan sudah berakhir.' : 'Ketuk kotak pemain = +poin · tombol ✖ = out/fault (poin ke lawan)';
+        }
+        el.querySelector('#cvPickBtn').textContent = courtPickServer ? '✕ Batal' : '🔄 Ubah server';
+        courtViewTick();
+    }
+
+    function courtViewTap(tl, idx) {
+        const m = activeMatches.find(x => x.id === courtViewId); if (!m) return;
+        try { navigator.vibrate && navigator.vibrate(15); } catch (e) {}
+        const sv = courtServeOf(m.id);
+        if (!(sv && sv.on) || courtPickServer) {          // memilih server
+            const sc = courtScoreOfTeam(m, tl), r = { A: 0, B: 0 };
+            r[tl] = sc % 2 === 0 ? idx : 1 - idx;
+            courtServeLocal[m.id] = { on: true, st: tl, r, h: [] };
+            courtPickServer = false;
+            const seed = courtScores[m.id] ? null : courtSeedFor(m);
+            courtEnqueue(m.id, async () => {
+                if (seed) { const sd = await supabaseClient.rpc('sm_court_seed', { p_match_id: m.id, p_a: seed.a, p_b: seed.b, p_players: seed.players }); if (sd.error) return sd; }
+                return supabaseClient.rpc('sm_court_serve_set', { p_match_id: m.id, p_st: tl, p_idx: idx });
+            });
+            renderCourtView(); return;
+        }
+        (courtUndoStack[m.id] = courtUndoStack[m.id] || []).push({ team: 'team' + tl, idx, type: 'point' });
+        updateScore(m.id, 'team' + tl, idx, 'point', false);
+        renderCourtView();
+    }
+    function courtViewError(tl, idx) {
+        const m = activeMatches.find(x => x.id === courtViewId); if (!m) return;
+        try { navigator.vibrate && navigator.vibrate(25); } catch (e) {}
+        (courtUndoStack[m.id] = courtUndoStack[m.id] || []).push({ team: 'team' + tl, idx, type: 'error' });
+        updateScore(m.id, 'team' + tl, idx, 'error', false);
+        renderCourtView();
+    }
+    function courtViewUndo() {
+        const id = courtViewId, stack = courtUndoStack[id];
+        if (!id || !stack || !stack.length) return;
+        const a = stack.pop();
+        updateScore(id, a.team, a.idx, a.type, true);
+        renderCourtView();
+    }
+    function courtViewTogglePick() { courtPickServer = !courtPickServer; renderCourtView(); }
+    function courtViewTimer() { if (courtViewId) toggleTimer(courtViewId); setTimeout(courtViewTick, 150); }
+    function courtViewClassic() { courtViewPref = false; closeCourtView(); }
+    function courtViewBack() { const id = courtViewId; closeCourtView(); closeScoreDashboard(); }
+    function courtViewFinish() { if (courtViewId) finishFromDashboard(courtViewId); }
 
     // Menerapkan SATU perubahan skor ke server berdasarkan data TERBARU di server.
     // Data pertandingan yang sedang dibuka disimpan di DUA tempat:
@@ -5175,6 +5445,7 @@ async function deletePicRole(roleId){
         if(localMatch) {
             const p = localMatch[team] && localMatch[team][playerIdx];
             if(applyScoreChange(localMatch, p)) {
+                if (COURT_ROWS) { const tl = team === 'teamA' ? 'A' : 'B'; courtServeLocal[matchId] = courtServeStep(courtServeOf(matchId), type === 'point' ? tl : (tl === 'A' ? 'B' : 'A'), delta); }
                 renderCourts();
                 if(window.scoreDashboardOpen) renderScoreDashboard(matchId);
             } else if(delta < 0) {
@@ -5653,9 +5924,11 @@ async function deletePicRole(roleId){
         document.body.style.overflow = 'hidden';
 
         renderScoreDashboard(matchId);
+        if (COURT_ROWS && courtViewPref) openCourtView(matchId);
     }
 
     function closeScoreDashboard() {
+        closeCourtView();
         // Pilihan pengguna: keluar dari dashboard Update Skor otomatis pause.
         const closingMatchId = window.scoreDashboardMatchId;
         const closingMatch = closingMatchId ? activeMatches.find(m => m.id === closingMatchId) : null;
@@ -5875,6 +6148,7 @@ async function deletePicRole(roleId){
 
    function renderCourts() {
     applyCourtOverlay();
+    if (courtViewId) { try { renderCourtView(); } catch (e) {} }
     const container = document.getElementById('courtsContainer');
     if (!container) return;
 
