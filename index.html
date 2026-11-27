@@ -2992,7 +2992,7 @@ async function deletePicRole(roleId){
         }
     }
 
-    async function performSaveToSupabase() {
+    async function performSaveToSupabase_raw() {
         if (!stateLoaded) { console.error('Simpan dibatalkan: data awal belum berhasil dimuat dari server (mencegah menimpa server dengan data kosong).'); return; }
 
         const MAX_ATTEMPT = 8;
@@ -3113,6 +3113,37 @@ async function deletePicRole(roleId){
     // ============================================================================
     function _sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+    // ============================================================================
+    // ANTREAN TULIS (lease lock di Supabase): device bergiliran menyimpan supaya tidak
+    // saling bentrok. Pengaman data TETAP pengecekan updated_at; lock ini hanya
+    // mengurangi bentrok & ulang. Kalau lock tidak bisa didapat dalam batas waktu,
+    // simpan tetap jalan (fail-open) karena pengecekan updated_at masih melindungi data.
+    // ============================================================================
+    const _LOCK_HOLDER = 'dev-' + Math.random().toString(36).slice(2) + '-' + Date.now().toString(36);
+    let _lockDepth = 0;
+    async function withServerLock(fn) {
+        if (_lockDepth > 0 || !supabaseClient) { return fn(); } // sudah memegang lock / tidak ada koneksi
+        let got = false;
+        const t0 = Date.now();
+        try {
+            while (Date.now() - t0 < 15000) {
+                const { data, error } = await supabaseClient.rpc('sm_lock_acquire', { p_holder: _LOCK_HOLDER, p_ttl_ms: 8000 });
+                if (error) { console.warn('[LOCK] gagal ambil lock, lanjut tanpa lock:', error.message); break; }
+                if (data === true) { got = true; break; }
+                await _sleep(120 + Math.random() * 180);
+            }
+        } catch (e) { console.warn('[LOCK] error, lanjut tanpa lock:', e); }
+        _lockDepth++;
+        try { return await fn(); }
+        finally {
+            _lockDepth--;
+            if (got) { try { await supabaseClient.rpc('sm_lock_release', { p_holder: _LOCK_HOLDER }); } catch (e) {} }
+        }
+    }
+    function performSaveToSupabase() { return withServerLock(() => performSaveToSupabase_raw()); }
+    function safeRoundMixMutationCore(...a) { return withServerLock(() => safeRoundMixMutationCore_raw(...a)); }
+    function safeApplyToServer(...a) { return withServerLock(() => safeApplyToServer_raw(...a)); }
+
     // Menerapkan SATU perubahan skor ke server berdasarkan data TERBARU di server.
     // Data pertandingan yang sedang dibuka disimpan di DUA tempat:
     //   (1) kolom biasa (active_matches / rr_matches / rr_bracket) -> salinan kerja
@@ -3142,7 +3173,7 @@ async function deletePicRole(roleId){
     // Ini mencegah device B menimpa perubahan device A dengan snapshot lama.
     // Alasan gagal terakhir dari mutasi Round Mix (dipakai agar alert menjelaskan penyebab sebenarnya).
     let lastRoundMixFailReason = '';
-    async function safeRoundMixMutationCore(mutateFn, options = {}) {
+    async function safeRoundMixMutationCore_raw(mutateFn, options = {}) {
         lastRoundMixFailReason = '';
         if (!stateLoaded || !supabaseClient) {
             lastRoundMixFailReason = 'Data awal belum selesai dimuat dari server / koneksi database belum tersedia. Refresh halaman lalu coba lagi.';
@@ -3220,7 +3251,7 @@ async function deletePicRole(roleId){
         return run;
     }
 
-    async function safeApplyToServer(mutateFn) {
+    async function safeApplyToServer_raw(mutateFn) {
         markSyncSaving();
         // Jangan cepat menganggap gagal. Pada multi-device, updated_at bisa berubah
         // beberapa kali dalam waktu singkat karena device lain / realtime / save lain.
