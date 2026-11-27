@@ -5996,7 +5996,16 @@ async function deletePicRole(roleId){
         const n = courtNumOf(match, activeMatches.indexOf(match));
         const nextRound = Number(match.round || 0) + 1;
         const p = (roundMixPreview || []).find(x => x.courtName === match.courtName) || null;
-        if (!p) return `<div class="score-next-box"><div class="score-next-title">⏭️ NEXT · LAPANGAN ${n} · RONDE ${nextRound}</div><div class="score-next-empty">Belum ada susunan berikutnya: pemain yang menunggu belum cukup. Susunan dibuat otomatis begitu ada pemain yang selesai main.</div></div>`;
+        if (!p) {
+            const _ev = activeEvent(), _att = (_ev && _ev.attendance) || {};
+            const _need = (parseInt(document.getElementById('playersPerTeam')?.value) || 2) * 2;
+            const _pvIds = new Set((roundMixPreview || []).flatMap(m => [...(m.teamA || []), ...(m.teamB || [])].map(x => x.id)));
+            const _wait = (players || []).filter(x => x.status === 'active' && _att[x.id] && !_pvIds.has(x.id)).length;
+            const _msg = _wait >= _need
+                ? 'Menyusun NEXT otomatis…'
+                : `Pemain yang menunggu baru ${_wait} dari ${_need} yang dibutuhkan (kurang ${_need - _wait}). Tandai pemain lain "Hadir" di Peserta Event, atau NEXT terisi otomatis begitu ada match selesai.`;
+            return `<div class="score-next-box"><div class="score-next-title">⏭️ NEXT · LAPANGAN ${n} · RONDE ${nextRound}</div><div class="score-next-empty">${_msg}</div></div>`;
+        }
         const A = p.teamA || [], B = p.teamB || [];
         const bal = evaluateMatchBalance([...A, ...B], A.length || 2);
         const ok = bal && bal.badness < 20;
@@ -6146,6 +6155,49 @@ async function deletePicRole(roleId){
         });
     }
 
+
+    // ===== NEXT TIDAK BOLEH KOSONG =====
+    // NEXT sebelumnya hanya dibuat saat generate / selesai match / ganti pemain. Kalau pemain baru ditandai
+    // hadir atau status pemain berubah belakangan, NEXT bisa tetap kosong walau pemain menunggu sudah cukup.
+    // Di sini tiap device mengecek dan mengisinya otomatis (tanpa menulis kalau memang tidak ada yang berubah).
+    let _ensureNextTimer = null, _ensureNextBusy = false, _ensureNextBackoff = 0;
+    function nextPreviewsMissing() {
+        const ev = activeEvent();
+        if (!ev || ev.mode !== 'match' || ev.status === 'finished' || !(activeMatches || []).length) return false;
+        const teamSize = parseInt(document.getElementById('playersPerTeam')?.value) || 2;
+        const att = ev.attendance || {};
+        const have = new Set((roundMixPreview || []).map(m => m.courtName));
+        if (!activeMatches.some(m => !have.has(m.courtName))) return false;
+        const inPv = new Set((roundMixPreview || []).flatMap(m => [...(m.teamA || []), ...(m.teamB || [])].map(p => p.id)));
+        const waiting = (players || []).filter(p => p.status === 'active' && att[p.id] && !inPv.has(p.id)).length;
+        return waiting >= teamSize * 2;
+    }
+    function scheduleEnsureNextPreviews() {
+        if (_ensureNextBusy || _ensureNextTimer || !stateLoaded) return;
+        if (!nextPreviewsMissing()) return;
+        const wait = Math.max(1200 + Math.random() * 2500, _ensureNextBackoff - Date.now());
+        _ensureNextTimer = setTimeout(async () => {
+            _ensureNextTimer = null;
+            if (_ensureNextBusy || document.visibilityState === 'hidden' || !nextPreviewsMissing()) return;
+            _ensureNextBusy = true;
+            try {
+                const teamSize = parseInt(document.getElementById('playersPerTeam')?.value) || 2;
+                const maxCourts = Math.max(1, parseInt(document.getElementById('totalCourts')?.value) || 1);
+                const ok = await safeRoundMixMutation(view => {
+                    const before = (view.roundMixPreview || []).length;
+                    refreshNextPreviewsInView(view, teamSize, maxCourts);
+                    return (view.roundMixPreview || []).length > before;
+                });
+                if (ok) renderCourts();
+                else {
+                    _ensureNextBackoff = Date.now() + 20000;       // tidak ada yang bisa diisi: jangan coba terus-menerus
+                    if (!lastRoundMixFailReason) markSyncSuccess();   // bukan error: kembalikan indikator simpan
+                }
+            } catch (e) { console.warn('[NEXT] gagal mengisi otomatis:', e); _ensureNextBackoff = Date.now() + 20000; }
+            finally { _ensureNextBusy = false; }
+        }, wait);
+    }
+
    function renderCourts() {
     applyCourtOverlay();
     if (courtViewId) { try { renderCourtView(); } catch (e) {} }
@@ -6213,6 +6265,7 @@ async function deletePicRole(roleId){
                         style="width:100%;padding:12px;font-size:1rem;">
                         🎯 BUKA PAPAN SKOR
                     </button>
+                    <button type="button" class="score-skip-btn" onclick="skipMatch('${match.id}')" style="min-height:48px;padding:12px;font-size:.95rem;background:transparent;color:var(--text-muted);border:1px solid var(--border);">⏭️ Skip / Hapus Game</button>
                 </div>
             </div>
         `;
@@ -6231,6 +6284,7 @@ async function deletePicRole(roleId){
     if (!activeMatches.length) {
         container.innerHTML = '<p style="color:var(--text-muted); text-align:center; padding:20px;">Tidak ada pertandingan yang sedang berjalan.</p>';
     }
+    try { scheduleEnsureNextPreviews(); } catch (e) {}
     // Susunan 'NEXT' sekarang ditampilkan di dalam papan skor tiap lapangan (bisa diganti dari sana).
     if (window.scoreDashboardOpen && window.scoreDashboardMatchId) {
         renderScoreDashboard(window.scoreDashboardMatchId);
